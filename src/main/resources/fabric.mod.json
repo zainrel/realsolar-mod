@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "realsolar",
+  "version": "${version}",
+  "name": "Realistic Solar Cycle",
+  "description": "Реалистичная длина дня, угол солнца (60° летом, 15° зимой), 28-дневный год, выбор начального дня (1-28), Заполярье и сетевая синхронизация для Minecraft 26.3.",
+  "authors": [
+    "RealSolarDev"
+  ],
+  "license": "MIT",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "com.example.realsolar.RealSolarMod"
+    ],
+    "client": [
+      "com.example.realsolar.client.RealSolarClientMod"
+    ]
+  },
+  "mixins": [
+    "realsolar.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.19.5",
+    "minecraft": "~26.3",
+    "java": ">=25",
+    "fabric-api": "*"
+  }
+}
