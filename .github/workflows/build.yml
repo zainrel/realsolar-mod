@@ -22,6 +22,400 @@ jobs:
         with:
           gradle-version: '9.6.0'
 
+      - name: Download MC 26.3 Dependencies
+        run: gradle compileJava --no-daemon || true
+
+      - name: Auto-Adapt API for MC 26.3
+        run: |
+          python3 - << 'EOF'
+          import os, subprocess, zipfile, re
+
+          def find_all_jars():
+              jars = []
+              for root in [os.path.expanduser("~/.gradle/caches"), ".gradle"]:
+                  if not os.path.exists(root):
+                      continue
+                  for dirpath, _, filenames in os.walk(root):
+                      for fn in filenames:
+                          if fn.endswith(".jar") and not fn.endswith("-sources.jar") and not fn.endswith("-javadoc.jar"):
+                              jars.append(os.path.join(dirpath, fn))
+              return jars
+
+          ALL_JARS = find_all_jars()
+          CP = ":".join(ALL_JARS)
+
+          def find_jar_with_class(cls_path):
+              for j in ALL_JARS:
+                  try:
+                      with zipfile.ZipFile(j, "r") as zf:
+                          if cls_path in zf.namelist():
+                              return j
+                  except Exception:
+                      pass
+              return None
+
+          def javap(cls_name, code=False):
+              target_jar = find_jar_with_class(cls_name.replace(".", "/") + ".class")
+              if not target_jar:
+                  return ""
+              cmd = ["javap", "-cp", CP, "-p"]
+              if code:
+                  cmd.append("-c")
+              cmd.append(cls_name)
+              res = subprocess.run(cmd, capture_output=True, text=True)
+              return res.stdout
+
+          # 1. Identifier vs ResourceLocation
+          has_identifier = find_jar_with_class("net/minecraft/resources/Identifier.class") is not None
+          id_class = "Identifier" if has_identifier else "ResourceLocation"
+          id_import = f"net.minecraft.resources.{id_class}"
+
+          # 2. PayloadTypeRegistry S2C method
+          ptr_out = javap("net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry")
+          s2c_method = "clientboundPlay"
+          for cand in ["clientboundPlay", "playS2C", "playClientbound"]:
+              if f" {cand}(" in ptr_out:
+                  s2c_method = cand
+                  break
+          else:
+              m = re.search(r"public static \S+ (\w+)\(\);", ptr_out)
+              if m:
+                  s2c_method = m.group(1)
+
+          # 3. Level / LevelData time getter
+          level_out = javap("net.minecraft.world.level.Level") + "\n" + javap("net.minecraft.world.level.LevelTimeAccess")
+          ld_out = javap("net.minecraft.world.level.storage.LevelData")
+
+          def pick_time_expr(var_name):
+              for mname in ["getDayTime", "dayTime", "getClockTime", "getGameTime", "gameTime"]:
+                  if re.search(rf"\blong\s+{mname}\(\)", level_out):
+                      return f"{var_name}.{mname}()"
+              for mname in ["getDayTime", "dayTime", "getGameTime", "gameTime"]:
+                  if re.search(rf"\blong\s+{mname}\(\)", ld_out):
+                      return f"{var_name}.getLevelData().{mname}()"
+              return f"{var_name}.getGameTime()"
+
+          level_time_expr = pick_time_expr("level")
+          mc_level_time_expr = pick_time_expr("mc.level")
+          ctx_level_time_expr = pick_time_expr("ctx.getSource().getLevel()")
+
+          # 4. DimensionType & SkyRenderer checks
+          dim_out = javap("net.minecraft.world.level.dimension.DimensionType")
+          has_dim_time_of_day = "float timeOfDay(long)" in dim_out
+          has_sky_light = "boolean hasSkyLight()" in dim_out
+
+          sky_out = javap("net.minecraft.client.renderer.SkyRenderer", code=True)
+          has_render_sun_moon = "renderSunMoonAndStars" in sky_out and "mulPose" in sky_out
+
+          # Write SolarSyncPayload.java
+          with open("src/main/java/com/example/realsolar/network/SolarSyncPayload.java", "w") as f:
+              f.write(f'''package com.example.realsolar.network;
+
+          import com.example.realsolar.RealSolarMod;
+          import com.example.realsolar.SolarConfig;
+          import net.minecraft.network.RegistryFriendlyByteBuf;
+          import net.minecraft.network.codec.StreamCodec;
+          import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+          import {id_import};
+
+          public record SolarSyncPayload(
+                  double latitudeDegrees,
+                  double axialTiltDegrees,
+                  int daysPerYear,
+                  int startDay,
+                  boolean realisticWinterDimming
+          ) implements CustomPacketPayload {{
+
+              public static final CustomPacketPayload.Type<SolarSyncPayload> TYPE =
+                      new CustomPacketPayload.Type<>({id_class}.fromNamespaceAndPath(RealSolarMod.MOD_ID, "sync_config"));
+
+              public static final StreamCodec<RegistryFriendlyByteBuf, SolarSyncPayload> CODEC =
+                      StreamCodec.ofMember(SolarSyncPayload::write, SolarSyncPayload::new);
+
+              public SolarSyncPayload(RegistryFriendlyByteBuf buf) {{
+                  this(
+                          buf.readDouble(),
+                          buf.readDouble(),
+                          buf.readVarInt(),
+                          buf.readVarInt(),
+                          buf.readBoolean()
+                  );
+              }}
+
+              public void write(RegistryFriendlyByteBuf buf) {{
+                  buf.writeDouble(this.latitudeDegrees);
+                  buf.writeDouble(this.axialTiltDegrees);
+                  buf.writeVarInt(this.daysPerYear);
+                  buf.writeVarInt(this.startDay);
+                  buf.writeBoolean(this.realisticWinterDimming);
+              }}
+
+              public static SolarSyncPayload fromCurrentConfig() {{
+                  return new SolarSyncPayload(
+                          SolarConfig.latitudeDegrees,
+                          SolarConfig.axialTiltDegrees,
+                          SolarConfig.daysPerYear,
+                          SolarConfig.startDay,
+                          SolarConfig.realisticWinterDimming
+                  );
+              }}
+
+              @Override
+              public Type<? extends CustomPacketPayload> type() {{
+                  return TYPE;
+              }}
+          }}
+          ''')
+
+          # Write LevelMixin.java
+          sky_check = "if (!level.dimensionType().hasSkyLight()) { return; }" if has_sky_light else ""
+          with open("src/main/java/com/example/realsolar/mixin/LevelMixin.java", "w") as f:
+              f.write(f'''package com.example.realsolar.mixin;
+
+          import com.example.realsolar.SolarCalculator;
+          import net.minecraft.util.Mth;
+          import net.minecraft.world.level.Level;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.Shadow;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+          @Mixin(Level.class)
+          public abstract class LevelMixin {{
+              @Shadow private int skyDarken;
+
+              @Inject(method = "updateSkyBrightness", at = @At("HEAD"), cancellable = true)
+              private void realsolar$updateRealisticSkyBrightness(CallbackInfo ci) {{
+                  Level level = (Level) (Object) this;
+                  {sky_check}
+                  long dayTime = {level_time_expr};
+                  float rain = level.getRainLevel(1.0F);
+                  float thunder = level.getThunderLevel(1.0F);
+
+                  this.skyDarken = Mth.clamp(
+                          SolarCalculator.calculateSkyDarken(dayTime, rain, thunder),
+                          0, 11
+                  );
+                  ci.cancel();
+              }}
+          }}
+          ''')
+
+          # Write DimensionTypeMixin.java
+          if has_dim_time_of_day:
+              dim_mixin_body = '''
+              @Inject(method = "timeOfDay", at = @At("HEAD"), cancellable = true)
+              private void realsolar$overrideTimeOfDay(long dayTime, CallbackInfoReturnable<Float> cir) {
+                  cir.setReturnValue(SolarCalculator.getRealisticCelestialAngle(dayTime));
+              }
+              '''
+          else:
+              dim_mixin_body = ""
+
+          with open("src/main/java/com/example/realsolar/mixin/DimensionTypeMixin.java", "w") as f:
+              f.write(f'''package com.example.realsolar.mixin;
+
+          import com.example.realsolar.SolarCalculator;
+          import net.minecraft.world.level.dimension.DimensionType;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+          @Mixin(DimensionType.class)
+          public abstract class DimensionTypeMixin {{
+              {dim_mixin_body}
+          }}
+          ''')
+
+          # Write SkyRendererMixin.java
+          if has_render_sun_moon:
+              sky_mixin_body = f'''
+              @ModifyArg(
+                  method = "renderSunMoonAndStars",
+                  at = @At(
+                      value = "INVOKE",
+                      target = "Lcom/mojang/blaze3d/vertex/PoseStack;mulPose(Lorg/joml/Quaternionf;)V",
+                      ordinal = 0
+                  ),
+                  index = 0
+              )
+              private Quaternionf realsolar$modifySunRotation(Quaternionf vanillaTimeRotation) {{
+                  Minecraft mc = Minecraft.getInstance();
+                  if (mc.level == null) {{
+                      return vanillaTimeRotation;
+                  }}
+
+                  long dayTime = {mc_level_time_expr};
+                  float maxNoonElevation = (float) SolarCalculator.getNoonMaxElevationDegrees(dayTime);
+                  float zenithTiltDegrees = 90.0F - maxNoonElevation;
+
+                  Quaternionf seasonalTilt = new Quaternionf(Axis.XP.rotationDegrees(zenithTiltDegrees));
+                  seasonalTilt.mul(vanillaTimeRotation);
+                  return seasonalTilt;
+              }}
+              '''
+          else:
+              sky_mixin_body = ""
+
+          with open("src/main/java/com/example/realsolar/mixin/client/SkyRendererMixin.java", "w") as f:
+              f.write(f'''package com.example.realsolar.mixin.client;
+
+          import com.example.realsolar.SolarCalculator;
+          import com.mojang.math.Axis;
+          import net.minecraft.client.Minecraft;
+          import net.minecraft.client.renderer.SkyRenderer;
+          import org.joml.Quaternionf;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.ModifyArg;
+
+          @Mixin(SkyRenderer.class)
+          public class SkyRendererMixin {{
+              {sky_mixin_body}
+          }}
+          ''')
+
+          # Write RealSolarMod.java
+          with open("src/main/java/com/example/realsolar/RealSolarMod.java", "w") as f:
+              f.write(f'''package com.example.realsolar;
+
+          import com.example.realsolar.network.SolarSyncPayload;
+          import com.mojang.brigadier.arguments.DoubleArgumentType;
+          import com.mojang.brigadier.arguments.IntegerArgumentType;
+          import net.fabricmc.api.ModInitializer;
+          import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
+          import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
+          import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
+          import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+          import net.minecraft.commands.Commands;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.server.MinecraftServer;
+          import net.minecraft.server.level.ServerLevel;
+          import net.minecraft.server.level.ServerPlayer;
+
+          public class RealSolarMod implements ModInitializer {{
+              public static final String MOD_ID = "realsolar";
+
+              @Override
+              public void onInitialize() {{
+                  SolarConfig.load();
+
+                  PayloadTypeRegistry.{s2c_method}().register(SolarSyncPayload.TYPE, SolarSyncPayload.CODEC);
+
+                  ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {{
+                      sender.sendPacket(SolarSyncPayload.fromCurrentConfig());
+                  }});
+
+                  CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {{
+                      dispatcher.register(Commands.literal("solar")
+                          .then(Commands.literal("info").executes(ctx -> {{
+                              ServerLevel level = ctx.getSource().getLevel();
+                              long time = {level_time_expr};
+                              int dayOfYear = SolarCalculator.getCurrentDayOfYear(time);
+                              int seasonIndex = ((dayOfYear - 1) * 4) / SolarConfig.daysPerYear;
+                              String[] seasons = {{"Весна (Дни 1-7)", "Лето (Дни 8-14)", "Осень (Дни 15-21)", "Зима (Дни 22-28)"}};
+                              String season = seasons[Math.clamp(seasonIndex, 0, 3)];
+
+                              double currentAlt = SolarCalculator.getSolarElevationDegrees(time);
+                              double maxAlt = SolarCalculator.getNoonMaxElevationDegrees(time);
+                              double dayHours = SolarCalculator.getDaylightHours(time);
+                              int skyDarken = level.getSkyDarken();
+
+                              boolean isPolar = Math.abs(SolarConfig.latitudeDegrees) >= (90.0 - SolarConfig.axialTiltDegrees);
+                              String zoneName = isPolar ? "Заполярье (Полярный круг)" : "Умеренный/Южный пояс";
+
+                              ctx.getSource().sendSuccess(() -> Component.literal(String.format(
+                                      "§6=== Реалистичное Солнце (26.3 Online Sync) ===\\n" +
+                                      "§eТекущий день года: §f%d из %d (%s) §7[Начальный день: %d]\\n" +
+                                      "§eШирота: §f%.1f° (%s)\\n" +
+                                      "§eВысота солнца сейчас: §f%.1f° §7(Максимум сегодня: %.1f°)\\n" +
+                                      "§eДлина светового дня: §f%.1f ч. из 24 ч.\\n" +
+                                      "§eСвет неба: §f%d/15 §7(skyDarken: %d)",
+                                      dayOfYear, SolarConfig.daysPerYear, season, SolarConfig.startDay,
+                                      SolarConfig.latitudeDegrees, zoneName,
+                                      currentAlt, maxAlt, dayHours, 15 - skyDarken, skyDarken
+                              )), false);
+                              return 1;
+                          }}))
+                          .then(Commands.literal("startday")
+                              .then(Commands.argument("day", IntegerArgumentType.integer(1, 28))
+                                  .executes(ctx -> {{
+                                      int startDay = IntegerArgumentType.getInteger(ctx, "day");
+                                      SolarConfig.startDay = Math.clamp(startDay, 1, SolarConfig.daysPerYear);
+                                      SolarConfig.save();
+                                      applyAndSync(ctx.getSource().getServer());
+
+                                      int currentDay = SolarCalculator.getCurrentDayOfYear({ctx_level_time_expr});
+                                      ctx.getSource().sendSuccess(() -> Component.literal(
+                                              "§a[RealSolar] Начальный день установлен на " + SolarConfig.startDay +
+                                              " (текущий день в мире теперь: " + currentDay + " из " + SolarConfig.daysPerYear + "). Синхронизировано со всеми игроками!"
+                                      ), true);
+                                      return 1;
+                                  }})
+                              )
+                          )
+                          .then(Commands.literal("latitude")
+                              .then(Commands.argument("degrees", DoubleArgumentType.doubleArg(-90.0, 90.0))
+                                  .executes(ctx -> {{
+                                      double lat = DoubleArgumentType.getDouble(ctx, "degrees");
+                                      SolarConfig.latitudeDegrees = lat;
+                                      SolarConfig.save();
+                                      applyAndSync(ctx.getSource().getServer());
+                                      ctx.getSource().sendSuccess(() -> Component.literal(
+                                              "§a[RealSolar] Широта установлена на " + lat + "° и синхронизирована со всеми игроками онлайн!"
+                                      ), true);
+                                      return 1;
+                                  }})
+                              )
+                          )
+                          .then(Commands.literal("preset")
+                              .then(Commands.literal("temperate").executes(ctx -> {{
+                                  SolarConfig.latitudeDegrees = 52.5;
+                                  SolarConfig.save();
+                                  applyAndSync(ctx.getSource().getServer());
+                                  ctx.getSource().sendSuccess(() -> Component.literal(
+                                          "§a[RealSolar] Включен умеренный пояс (52.5°): солнце до 60° летом и до 15° зимой (синхронизировано)."
+                                  ), true);
+                                  return 1;
+                              }}))
+                              .then(Commands.literal("polar").executes(ctx -> {{
+                                  SolarConfig.latitudeDegrees = 72.0;
+                                  SolarConfig.save();
+                                  applyAndSync(ctx.getSource().getServer());
+                                  ctx.getSource().sendSuccess(() -> Component.literal(
+                                          "§b[RealSolar] Включено Заполярье (72.0°): полярный день летом и полярная ночь зимой (синхронизировано)!"
+                                  ), true);
+                                  return 1;
+                              }}))
+                              .then(Commands.literal("equator").executes(ctx -> {{
+                                  SolarConfig.latitudeDegrees = 0.0;
+                                  SolarConfig.save();
+                                  applyAndSync(ctx.getSource().getServer());
+                                  ctx.getSource().sendSuccess(() -> Component.literal(
+                                          "§e[RealSolar] Включен Экватор (0.0°): день равен ночи круглый год (синхронизировано)."
+                                  ), true);
+                                  return 1;
+                              }}))
+                          )
+                      );
+                  }});
+              }}
+
+              public static void applyAndSync(MinecraftServer server) {{
+                  for (ServerLevel level : server.getAllLevels()) {{
+                      level.updateSkyBrightness();
+                  }}
+                  SolarSyncPayload payload = SolarSyncPayload.fromCurrentConfig();
+                  for (ServerPlayer player : server.getPlayerList().getPlayers()) {{
+                      ServerPlayNetworking.send(player, payload);
+                  }}
+              }}
+          }}
+          ''')
+          EOF
+
       - name: Build Mod JAR
         run: gradle build --no-daemon
 
