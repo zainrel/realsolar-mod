@@ -28,7 +28,7 @@ jobs:
       - name: Auto-Wire Mixins for MC 26.3
         run: |
           python3 - << 'EOF'
-          import os, subprocess, zipfile, re, json
+          import os, subprocess, zipfile, re
 
           def find_all_jars():
               jars = []
@@ -82,16 +82,14 @@ jobs:
               if m:
                   s2c_method = m.group(1)
 
-          # 3. Точный поиск метода времени суток (DayTime) в LevelData и Level
-          level_out = javap("net.minecraft.world.level.Level") + "\n" + javap("net.minecraft.world.level.LevelTimeAccess") + "\n" + javap("net.minecraft.client.multiplayer.ClientLevel")
+          # 3. Точный метод получения времени суток (DayTime) в LevelData и Level
+          lvl_only_out = javap("net.minecraft.world.level.Level")
+          lr_reader_out = javap("net.minecraft.world.level.LevelReader")
+          clvl_out = javap("net.minecraft.client.multiplayer.ClientLevel")
           ld_out = javap("net.minecraft.world.level.storage.LevelData")
-          print("=== LEVEL TIME METHODS ===")
-          for line in (level_out + "\n" + ld_out).splitlines():
-              if any(w in line.lower() for w in ["time", "day", "angle", "celestial", "sun", "sky"]):
-                  print("  ", line)
+          level_out = lvl_only_out + "\n" + lr_reader_out + "\n" + clvl_out
 
           def pick_daytime_expr(var_name):
-              # Сначала ищем именно DayTime в LevelData (чтобы команда /time set работала!)
               for mname in ["getDayTime", "dayTime"]:
                   if re.search(rf"\blong\s+{mname}\(\)", ld_out):
                       return f"{var_name}.getLevelData().{mname}()"
@@ -103,41 +101,19 @@ jobs:
           level_time_expr = pick_daytime_expr("level")
           mc_level_time_expr = pick_daytime_expr("mc.level")
           ctx_level_time_expr = pick_daytime_expr("ctx.getSource().getLevel()")
-          print(f"[AutoWire] Selected dayTime expression: {level_time_expr}")
 
-          # 4. Поиск всех методов timeOfDay / getTimeOfDay / getSunAngle в Level, LevelTimeAccess и DimensionType
+          # 4. Проверка методов угла солнца и времени суток в DimensionType и Level
           dim_out = javap("net.minecraft.world.level.dimension.DimensionType")
-          lta_out = javap("net.minecraft.world.level.LevelTimeAccess")
-          lvl_only_out = javap("net.minecraft.world.level.Level")
-          clvl_out = javap("net.minecraft.client.multiplayer.ClientLevel")
+          lvl_tod_methods = re.findall(r"public float (getTimeOfDay|timeOfDay|getSunAngle)\(([^)]*)\);", lvl_only_out)
 
-          print("=== DIMENSION_TYPE ===")
-          print(dim_out)
-          print("=== LEVEL_TIME_ACCESS ===")
-          print(lta_out)
-
-          # Проверяем, где именно считается угол солнца (timeOfDay / getTimeOfDay / getSunAngle)
-          dim_tod_match = re.search(r"public float (timeOfDay|getTimeOfDay)\(long\);", dim_out)
-          lvl_tod_methods = re.findall(r"public float (getTimeOfDay|timeOfDay|getSunAngle)\(([^)]*)\);", lvl_only_out + "\n" + lta_out + "\n" + clvl_out)
-          print("[AutoWire] Level timeOfDay methods:", lvl_tod_methods)
-
-          # 5. Анализ SkyRenderer и LevelRenderer для наклона 3D-траектории солнца
+          # 5. Проверка SkyRenderer для наклона 3D-траектории солнца
           sky_out = javap("net.minecraft.client.renderer.SkyRenderer", code=True)
-          lr_out = javap("net.minecraft.client.renderer.LevelRenderer", code=True)
-          print("=== SKY_RENDERER SIGNATURES ===")
-          for line in sky_out.splitlines():
-              if "public " in line or "private " in line or "protected " in line or "mulPose" in line or "XP" in line or "ZP" in line or "YP" in line:
-                  print("  ", line)
-
-          # Находим все методы в SkyRenderer, которые принимают PoseStack первым аргументом
           sky_posestack_methods = re.findall(r"(?:public|private|protected)\s+void\s+(\w+)\(com\.mojang\.blaze3d\.vertex\.PoseStack[^)]*\);", sky_out)
-          # Предпочитаем методы, связанные с солнцем/небом
           target_sky_methods = [m for m in sky_posestack_methods if any(k in m.lower() for k in ["sun", "moon", "star", "sky", "celestial"])]
           if not target_sky_methods and sky_posestack_methods:
               target_sky_methods = [sky_posestack_methods[0]]
-          print("[AutoWire] Target SkyRenderer PoseStack methods:", target_sky_methods)
 
-          # Write SolarConfig.java (Начальный день по умолчанию = 8 [Пик лета, 60°], чтобы изменения были видны сразу!)
+          # 6. Начальный день по умолчанию = 8 (Пик лета, 60°), чтобы эффект был виден с первой секунды!
           with open("src/main/java/com/example/realsolar/SolarConfig.java", "r") as f:
               cfg_text = f.read()
           cfg_text = cfg_text.replace("public static int startDay = 1;", "public static int startDay = 8;")
@@ -205,34 +181,33 @@ jobs:
           }}
           ''')
 
-          # Формируем инъекции для LevelMixin.java (и освещение, и расчет угла солнца/длины дня напрямую в Level!)
+          # Формируем инъекции для LevelMixin.java (БЕЗ удаленного LevelTimeAccess!)
           level_extra_injections = ""
           seen_lvl_methods = set()
           for m_name, m_args in lvl_tod_methods:
               if (m_name, m_args) in seen_lvl_methods:
                   continue
               seen_lvl_methods.add((m_name, m_args))
-              # Проверим, что этот метод реально объявлен в самом классе Level (или переопределяется в нем)
-              if re.search(rf"public float {m_name}\({re.escape(m_args)}\);", lvl_only_out):
-                  if m_name == "getSunAngle":
-                      level_extra_injections += f'''
+              arg_decl = "float delta, " if m_args.strip() == "float" else ("long l, " if m_args.strip() == "long" else "")
+              if m_name == "getSunAngle":
+                  level_extra_injections += f'''
               @Inject(method = "{m_name}", at = @At("HEAD"), cancellable = true)
-              private void realsolar$override_{m_name}({ "float delta, " if "float" in m_args else ("long l, " if "long" in m_args else "") }CallbackInfoReturnable<Float> cir) {{
+              private void realsolar$override_{m_name}({arg_decl}CallbackInfoReturnable<Float> cir) {{
                   Level level = (Level) (Object) this;
                   long dayTime = {level_time_expr};
                   float angle = SolarCalculator.getRealisticCelestialAngle(dayTime);
                   cir.setReturnValue(angle * ((float) Math.PI * 2.0F));
               }}
-                      '''
-                  else:
-                      level_extra_injections += f'''
+                  '''
+              else:
+                  level_extra_injections += f'''
               @Inject(method = "{m_name}", at = @At("HEAD"), cancellable = true)
-              private void realsolar$override_{m_name}({ "float delta, " if "float" in m_args else ("long l, " if "long" in m_args else "") }CallbackInfoReturnable<Float> cir) {{
+              private void realsolar$override_{m_name}({arg_decl}CallbackInfoReturnable<Float> cir) {{
                   Level level = (Level) (Object) this;
                   long dayTime = {level_time_expr};
                   cir.setReturnValue(SolarCalculator.getRealisticCelestialAngle(dayTime));
               }}
-                      '''
+                  '''
 
           has_sky_light = "boolean hasSkyLight()" in dim_out
           sky_check = "if (!level.dimensionType().hasSkyLight()) { return; }" if has_sky_light else ""
@@ -243,7 +218,6 @@ jobs:
           import com.example.realsolar.SolarCalculator;
           import net.minecraft.util.Mth;
           import net.minecraft.world.level.Level;
-          import net.minecraft.world.level.LevelTimeAccess;
           import org.spongepowered.asm.mixin.Mixin;
           import org.spongepowered.asm.mixin.Shadow;
           import org.spongepowered.asm.mixin.injection.At;
@@ -252,7 +226,7 @@ jobs:
           import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
           @Mixin(Level.class)
-          public abstract class LevelMixin implements LevelTimeAccess {{
+          public abstract class LevelMixin {{
               @Shadow private int skyDarken;
 
               @Inject(method = "updateSkyBrightness", at = @At("HEAD"), cancellable = true)
@@ -269,36 +243,15 @@ jobs:
                   );
                   ci.cancel();
               }}
-
-              @Override
-              public float getTimeOfDay(float partialTick) {{
-                  Level level = (Level) (Object) this;
-                  long dayTime = {level_time_expr};
-                  return SolarCalculator.getRealisticCelestialAngle(dayTime);
-              }}
-
-              @Override
-              public float getSunAngle(float partialTick) {{
-                  return this.getTimeOfDay(partialTick) * ((float) Math.PI * 2.0F);
-              }}
               {level_extra_injections}
           }}
           ''')
-
-          # Проверяем, существуют ли getTimeOfDay(float) и getSunAngle(float) в LevelTimeAccess:
-          if "float getTimeOfDay(float)" not in lta_out and "float getTimeOfDay(float)" not in lvl_only_out:
-              with open("src/main/java/com/example/realsolar/mixin/LevelMixin.java", "r") as f:
-                  lm_code = f.read()
-              lm_code = re.sub(r"@Override\s+public float getTimeOfDay\(float partialTick\)\s*\{[^}]*\}", "", lm_code)
-              lm_code = re.sub(r"@Override\s+public float getSunAngle\(float partialTick\)\s*\{[^}]*\}", "", lm_code)
-              with open("src/main/java/com/example/realsolar/mixin/LevelMixin.java", "w") as f:
-                  f.write(lm_code)
 
           # Write DimensionTypeMixin.java
           dim_methods_all = re.findall(r"public float (\w+)\(long\);", dim_out)
           dim_mixin_body = ""
           for dm in dim_methods_all:
-              if "time" in dm.lower() or "angle" in dm.lower() or "sun" in dm.lower() or "day" in dm.lower():
+              if any(w in dm.lower() for w in ["time", "angle", "sun", "day"]):
                   dim_mixin_body += f'''
               @Inject(method = "{dm}", at = @At("HEAD"), cancellable = true)
               private void realsolar$override_{dm}(long dayTime, CallbackInfoReturnable<Float> cir) {{
@@ -322,22 +275,7 @@ jobs:
           }}
           ''')
 
-          # Write SkyRendererMixin.java — поворачиваем PoseStack при рендере солнца и луны!
-          sky_injects = ""
-          for idx, sm in enumerate(target_sky_methods):
-              sky_injects += f'''
-              @Inject(method = "{sm}", at = @At("HEAD"))
-              private void realsolar$tiltSky_{idx}(PoseStack poseStack, CallbackInfo ci, @Coerce Object... args) {{
-                  Minecraft mc = Minecraft.getInstance();
-                  if (mc.level == null) return;
-                  long dayTime = {mc_level_time_expr};
-                  float maxNoonElevation = (float) SolarCalculator.getNoonMaxElevationDegrees(dayTime);
-                  float zenithTiltDegrees = 90.0F - maxNoonElevation;
-                  poseStack.mulPose(Axis.XP.rotationDegrees(zenithTiltDegrees));
-              }}
-              '''
-
-          # Для надежности используем @ModifyVariable на PoseStack в первом методе рендера солнца (работает с ЛЮБЫМИ аргументами метода!)
+          # Write SkyRendererMixin.java — наклон 3D-солнца и луны через @ModifyVariable на PoseStack
           sky_modvar = ""
           if target_sky_methods:
               primary_m = target_sky_methods[0]
@@ -373,7 +311,18 @@ jobs:
           }}
           ''')
 
-          # Write RealSolarMod.java (плюс ежесекундное принудительное обновление освещения неба на сервере!)
+          # Write RealSolarMod.java (используем ServerTickEvents.END_SERVER_TICK для гарантированной совместимости)
+          ste_out = javap("net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents")
+          tick_hook = ""
+          if "END_SERVER_TICK" in ste_out:
+              tick_hook = '''
+                  ServerTickEvents.END_SERVER_TICK.register(server -> {
+                      for (ServerLevel level : server.getAllLevels()) {
+                          level.updateSkyBrightness();
+                      }
+                  });
+              '''
+
           with open("src/main/java/com/example/realsolar/RealSolarMod.java", "w") as f:
               f.write(f'''package com.example.realsolar;
 
@@ -404,10 +353,7 @@ jobs:
                   ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {{
                       sender.sendPacket(SolarSyncPayload.fromCurrentConfig());
                   }});
-
-                  ServerTickEvents.END_WORLD_TICK.register(level -> {{
-                      level.updateSkyBrightness();
-                  }});
+                  {tick_hook}
 
                   CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {{
                       dispatcher.register(Commands.literal("solar")
